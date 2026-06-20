@@ -1,0 +1,97 @@
+# Velox Coexist — customer CI execution home (add-coexist-customer-repo §4.4).
+#
+# Drop this at `.github/workflows/velox-coexist.yml` in YOUR repo to run Velox-authored Playwright specs
+# in your own pipeline (instead of a paired Velox Agent). Velox triggers it via `workflow_dispatch`,
+# carrying the authored spec; this job runs it against the Velox-provisioned CDP browser and commits the
+# verdict to `.velox-ci-results/<correlation_id>.json`, which Velox polls (see `makeCoexistCiRunBody`).
+#
+# Contract — the committed `velox-result.json` MUST match this shape (the svc parses it):
+#   { "passed": bool, "durationMs": number,
+#     "steps": [{ "title": str, "status": "passed"|"failed"|"skipped", "error"?: str }],
+#     "npmCiOk"?: bool, "baselineRan"?: bool, "baselinePassed"?: bool }
+# A red baseline (baselineRan:true, baselinePassed:false) makes Velox escalate as setup — never a code
+# verdict. Add your own auth/env secrets to the run step as your tests need them.
+
+name: Velox Coexist
+on:
+  workflow_dispatch:
+    inputs:
+      correlation_id: { required: true, type: string }
+      project_path:   { required: true, type: string }   # Playwright project root (e.g. ".", "e2e")
+      test_dir:       { required: true, type: string }   # relative to project_path
+      spec_file_name: { required: true, type: string }   # e.g. dt2-1.velox.spec.ts
+      spec_base64:    { required: true, type: string }   # the authored spec, base64
+      cdp_url:        { required: true, type: string }   # the Velox-provisioned CDP endpoint
+      baseline_test:  { required: false, type: string }  # a known-good test (relative to project_path)
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    permissions: { contents: write }   # to commit the result file
+    env:
+      VELOX_CDP_URL: ${{ inputs.cdp_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+
+      - name: npm ci
+        id: deps
+        working-directory: ${{ inputs.project_path }}
+        run: npm ci
+
+      - name: Baseline-green gate (optional)
+        id: baseline
+        if: ${{ inputs.baseline_test != '' }}
+        working-directory: ${{ inputs.project_path }}
+        continue-on-error: true
+        run: npx playwright test "${{ inputs.baseline_test }}" --reporter=line
+
+      - name: Write the Velox-authored spec
+        working-directory: ${{ inputs.project_path }}
+        run: |
+          mkdir -p "${{ inputs.test_dir }}"
+          printf '%s' "${{ inputs.spec_base64 }}" | base64 -d > "${{ inputs.test_dir }}/${{ inputs.spec_file_name }}"
+
+      - name: Run the authored spec (capture verdict)
+        id: run
+        if: ${{ inputs.baseline_test == '' || steps.baseline.outcome == 'success' }}
+        working-directory: ${{ inputs.project_path }}
+        continue-on-error: true
+        run: npx playwright test "${{ inputs.test_dir }}/${{ inputs.spec_file_name }}" --reporter=json > pw-report.json || true
+
+      - name: Build velox-result.json
+        working-directory: ${{ inputs.project_path }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            const baselineRan = process.env.BASELINE_TEST !== "";
+            const baselinePassed = process.env.BASELINE_OUTCOME === "success";
+            // baseline red → setup failure, no code verdict.
+            if (baselineRan && !baselinePassed) {
+              fs.writeFileSync("velox-result.json", JSON.stringify({ passed: false, durationMs: 0, steps: [], baselineRan: true, baselinePassed: false }));
+              process.exit(0);
+            }
+            let report = {};
+            try { report = JSON.parse(fs.readFileSync("pw-report.json", "utf8")); } catch {}
+            const specs = [];
+            (function walk(s){ for (const x of s||[]) { specs.push(...(x.specs||[])); walk(x.suites); } })(report.suites);
+            const result = specs[0]?.tests?.[0]?.results?.[0] || {};
+            const steps = (result.steps||[]).filter(st => (st.title||"").trim() && !/^(Before|After) Hooks$/.test(st.title))
+              .map(st => ({ title: st.title, status: st.error ? "failed" : "passed", ...(st.error?.message ? { error: st.error.message } : {}) }));
+            const passed = (report.stats?.unexpected ?? 1) === 0 && (report.stats?.expected ?? 0) > 0;
+            fs.writeFileSync("velox-result.json", JSON.stringify({ passed, durationMs: report.stats?.duration ?? 0, steps, npmCiOk: true, ...(baselineRan ? { baselineRan: true, baselinePassed: true } : {}) }));
+          '
+        env:
+          BASELINE_TEST: ${{ inputs.baseline_test }}
+          BASELINE_OUTCOME: ${{ steps.baseline.outcome }}
+
+      - name: Commit the verdict for Velox to poll
+        run: |
+          mkdir -p .velox-ci-results
+          mv "${{ inputs.project_path }}/velox-result.json" ".velox-ci-results/${{ inputs.correlation_id }}.json"
+          git config user.name "velox-ci"
+          git config user.email "ci@velox.local"
+          git add .velox-ci-results
+          git commit -m "velox-ci: result ${{ inputs.correlation_id }}"
+          git push
